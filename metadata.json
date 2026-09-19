@@ -1,0 +1,6 @@
+{
+  "name": "蘇若妤 AI 助理",
+  "description": "專屬全能生活秘書總監兼智商守護者蘇若妤，全方位支援導航出發、鬧鐘計時、日程排程、通話備忘與專業諮詢兜底。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
