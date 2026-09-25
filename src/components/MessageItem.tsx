@@ -91,15 +91,11 @@ export const MessageItem: React.FC<MessageItemProps> = ({
             className={`w-8 h-8 rounded-full flex items-center justify-center font-medium text-xs shadow-2xs border ${
               currentUserRole === 'boss'
                 ? 'bg-amber-100 border-amber-300 text-amber-900'
-                : currentUserRole === 'guest'
-                ? 'bg-blue-100 border-blue-300 text-blue-900'
                 : 'bg-stone-200 border-stone-300 text-stone-600'
             }`}
           >
             {currentUserRole === 'boss' ? (
               <Briefcase className="w-4 h-4" />
-            ) : currentUserRole === 'guest' ? (
-              <User className="w-4 h-4 text-blue-700" />
             ) : (
               <User className="w-4 h-4" />
             )}
@@ -123,8 +119,6 @@ export const MessageItem: React.FC<MessageItemProps> = ({
             {isUser
               ? currentUserRole === 'boss'
                 ? '老闆 (你)'
-                : currentUserRole === 'guest'
-                ? '訪客 (你)'
                 : '余彥佐 (你)'
               : '蘇若妤'}
           </span>

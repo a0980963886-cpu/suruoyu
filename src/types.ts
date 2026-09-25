@@ -17,10 +17,35 @@ export interface AttachedFile {
   textContent?: string;
 }
 
-export type UserRole = 'employee' | 'boss' | 'guest';
+export type UserRole = 'admin' | 'boss' | 'user' | 'guest';
 
-export interface BossTask {
+export interface AuthUser {
   id: string;
+  email: string;
+  role: UserRole;
+  name: string;
+  token: string;
+  tenantId: string;
+  adminCustomSettings?: {
+    customCallName?: string;
+    customTonePrompt?: string;
+  };
+}
+
+export interface LoginResponse {
+  success: boolean;
+  user?: AuthUser;
+  token?: string;
+  error?: string;
+}
+
+export interface SharedTask {
+  id: string;
+  creatorId: string;
+  creatorName: string;
+  creatorRole: UserRole;
+  assigneeId: string; // specific userId or 'ALL'
+  assigneeName?: string;
   taskTitle: string;
   summary: string;
   rawInstruction?: string;
@@ -30,7 +55,11 @@ export interface BossTask {
   status: 'pending' | 'delivered' | 'completed';
   deliveredAt?: number;
   completedAt?: number;
+  tenantId: string;
 }
+
+// Backward compatibility alias
+export type BossTask = SharedTask;
 
 export type ActionType =
   | 'NAVIGATE'

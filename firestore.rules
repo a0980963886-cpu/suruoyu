@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Deny all direct client-side reads and writes to enforce backend API proxying
+    // All Firestore interactions are mediated securely by Express backend with authenticateToken
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

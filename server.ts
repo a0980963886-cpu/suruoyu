@@ -1,57 +1,52 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
-import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+
+import {
+  authenticateToken,
+  requireRole,
+  denyGuest,
+  signUserToken,
+} from './server/authMiddleware.ts';
+import {
+  createUser,
+  getUserByEmail,
+  getUserById,
+  verifyUserPassword,
+  updateUserRole,
+  toggleUserSuspension,
+  listTenantUsers,
+  updateAdminCustomSettings,
+  DEFAULT_TENANT_ID,
+} from './server/userService.ts';
+import {
+  createTask,
+  listVisibleTasks,
+  deliverTask,
+  completeTask,
+  deleteTask,
+} from './server/taskService.ts';
+import {
+  listUserAlarms,
+  saveUserAlarm,
+  toggleUserAlarm,
+  deleteUserAlarm,
+  listUserNotes,
+  saveUserNote,
+  toggleUserNote,
+  deleteUserNote,
+  listUserSchedules,
+  saveUserSchedule,
+  deleteUserSchedule,
+  importLocalData,
+} from './server/userDataService.ts';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
-
-// Shared Brain Boss Task interface & persistence
-export interface ServerBossTask {
-  id: string;
-  taskTitle: string;
-  summary: string;
-  rawInstruction?: string;
-  deadline?: string;
-  priority?: 'urgent' | 'normal' | 'low';
-  createdAt: number;
-  status: 'pending' | 'delivered' | 'completed';
-  deliveredAt?: number;
-  completedAt?: number;
-}
-
-const DATA_DIR = path.join(process.cwd(), 'data');
-const TASKS_FILE = path.join(DATA_DIR, 'boss_tasks.json');
-
-let bossTasks: ServerBossTask[] = [];
-
-function loadBossTasks() {
-  try {
-    if (fs.existsSync(TASKS_FILE)) {
-      const data = fs.readFileSync(TASKS_FILE, 'utf-8');
-      bossTasks = JSON.parse(data);
-    }
-  } catch (err) {
-    console.error('Failed to load boss tasks:', err);
-  }
-}
-
-function saveBossTasks() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(TASKS_FILE, JSON.stringify(bossTasks, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Failed to save boss tasks:', err);
-  }
-}
-
-loadBossTasks();
 
 // Increase payload limit for base64 audio uploads
 app.use(express.json({ limit: '25mb' }));
@@ -72,12 +67,20 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+const CANDIDATE_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-flash-lite-latest',
+  'gemini-3.5-flash-lite',
+  'gemini-flash-latest',
+  'gemini-3.6-flash',
+  'gemini-3.1-flash-lite',
+];
 
 async function generateContentWithRetry(ai: GoogleGenAI, request: any) {
   let lastError: any = null;
-  for (const model of CANDIDATE_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  // Two passes through candidate models with instant failover on 503/temporary errors
+  for (let pass = 0; pass < 2; pass++) {
+    for (const model of CANDIDATE_MODELS) {
       try {
         const response = await ai.models.generateContent({
           ...request,
@@ -95,13 +98,16 @@ async function generateContentWithRetry(ai: GoogleGenAI, request: any) {
           errMsg.includes('RESOURCE_EXHAUSTED');
 
         if (isTemporary) {
-          console.warn(`Model ${model} attempt ${attempt + 1} hit temporary limit/503. Retrying or switching model...`);
-          await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+          console.warn(`Model ${model} (pass ${pass + 1}) hit 503/high-demand. Failing over to next candidate model...`);
           continue;
         } else {
           throw err;
         }
       }
+    }
+    // If all models in first pass experienced temporary high demand, wait briefly before second pass
+    if (pass === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
     }
   }
   throw lastError;
@@ -196,79 +202,464 @@ const SU_RUOYU_BOSS_INSTRUCTION = `你是「蘇若妤 (Su Ruoyu)」。
 - 天氣：type = "CHECK_WEATHER", weatherLocation = "地點"
 - 若無特定生活動作：type = "NONE"`;
 
+// Auth Endpoints: Register, Login, Guest, Me, Logout
+app.post('/api/auth/register', async (req: Request, res: Response) => {
+  try {
+    const { email, password, displayName, adminBootstrapSecret } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: '請提供完整的帳號 (Email) 與密碼' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, error: '密碼長度至少需為 6 個字元' });
+    }
+
+    const tenantId = (req.headers['x-tenant-id'] as string) || DEFAULT_TENANT_ID;
+
+    const newUser = await createUser({
+      email,
+      passwordPlainText: password,
+      displayName: displayName || '',
+      tenantId,
+      adminBootstrapSecret,
+    });
+
+    const token = signUserToken({
+      userId: newUser.id,
+      email: newUser.email,
+      role: newUser.role,
+      tenantId: newUser.tenantId,
+      tokenVersion: newUser.tokenVersion,
+    });
+
+    return res.json({
+      success: true,
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        role: newUser.role,
+        name: newUser.displayName,
+        token,
+        tenantId: newUser.tenantId,
+        adminCustomSettings: newUser.adminCustomSettings,
+      },
+      token,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || '註冊失敗，請重試' });
+  }
+});
+
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: '請提供帳號與密碼' });
+    }
+
+    const tenantId = (req.headers['x-tenant-id'] as string) || DEFAULT_TENANT_ID;
+    const user = await getUserByEmail(email, tenantId);
+    if (!user) {
+      return res.status(401).json({ success: false, error: '帳號或密碼錯誤，請確認後重試' });
+    }
+
+    if (user.isSuspended) {
+      return res.status(401).json({ success: false, error: '此帳號已被管理員停用，禁止登入' });
+    }
+
+    const isMatch = await verifyUserPassword(password, user.passwordHash);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, error: '帳號或密碼錯誤，請確認後重試' });
+    }
+
+    const token = signUserToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      tenantId: user.tenantId,
+      tokenVersion: user.tokenVersion,
+    });
+
+    return res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        name: user.displayName,
+        token,
+        tenantId: user.tenantId,
+        adminCustomSettings: user.adminCustomSettings,
+      },
+      token,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || '登入伺服器發生錯誤' });
+  }
+});
+
+// Guest Experience Endpoint: issues sandboxed guest token
+app.post('/api/auth/guest', (req: Request, res: Response) => {
+  const token = signUserToken(
+    {
+      userId: 'guest-session',
+      email: 'guest@experience.local',
+      role: 'guest',
+      tenantId: DEFAULT_TENANT_ID,
+      tokenVersion: 1,
+      isGuest: true,
+    },
+    '1d'
+  );
+
+  res.json({
+    success: true,
+    user: {
+      id: 'guest-session',
+      email: 'guest@experience.local',
+      role: 'guest',
+      name: '訪客體驗者',
+      token,
+      tenantId: DEFAULT_TENANT_ID,
+    },
+    token,
+  });
+});
+
+// Check current authenticated session
+app.get('/api/auth/me', authenticateToken, (req: Request, res: Response) => {
+  const user = req.user!;
+  res.json({
+    success: true,
+    user: {
+      id: user.userId,
+      email: user.email,
+      role: user.role,
+      name: user.displayName,
+      tenantId: user.tenantId,
+      adminCustomSettings: user.adminCustomSettings,
+    },
+  });
+});
+
+// Logout endpoint
+app.post('/api/auth/logout', authenticateToken, (req: Request, res: Response) => {
+  res.json({ success: true, message: '已成功登出' });
+});
+
+// Admin Panel APIs
+app.get('/api/admin/users', authenticateToken, requireRole('admin'), async (req: Request, res: Response) => {
+  try {
+    const users = await listTenantUsers(req.user!.userId, req.user!.tenantId);
+    res.json({ success: true, users });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/set-role', authenticateToken, requireRole('admin'), async (req: Request, res: Response) => {
+  try {
+    const { targetUserId, newRole } = req.body;
+    if (!targetUserId || !newRole) {
+      return res.status(400).json({ success: false, error: '請提供目標使用者 ID 與目標角色' });
+    }
+    const updated = await updateUserRole({
+      adminUserId: req.user!.userId,
+      targetUserId,
+      newRole,
+      tenantId: req.user!.tenantId,
+    });
+    res.json({ success: true, user: updated });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/toggle-suspend', authenticateToken, requireRole('admin'), async (req: Request, res: Response) => {
+  try {
+    const { targetUserId, suspend } = req.body;
+    const updated = await toggleUserSuspension({
+      adminUserId: req.user!.userId,
+      targetUserId,
+      suspend: Boolean(suspend),
+      tenantId: req.user!.tenantId,
+    });
+    res.json({ success: true, user: updated });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/custom-settings', authenticateToken, requireRole('admin'), async (req: Request, res: Response) => {
+  try {
+    const { customCallName, customTonePrompt } = req.body;
+    const updated = await updateAdminCustomSettings({
+      adminUserId: req.user!.userId,
+      customCallName,
+      customTonePrompt,
+      tenantId: req.user!.tenantId,
+    });
+    res.json({ success: true, user: updated });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     hasKey: Boolean(process.env.GEMINI_API_KEY),
     name: '蘇若妤 AI 助理',
-    pendingBossTasks: bossTasks.filter((t) => t.status === 'pending').length,
   });
 });
 
-// Boss Tasks API
-app.get('/api/boss-tasks', (req, res) => {
-  res.json(bossTasks);
-});
-
-app.get('/api/boss-tasks/pending', (req, res) => {
-  const pending = bossTasks.filter((t) => t.status === 'pending');
-  res.json(pending);
-});
-
-app.post('/api/boss-tasks', (req, res) => {
-  const { taskTitle, summary, rawInstruction, deadline, priority } = req.body;
-  const newTask: ServerBossTask = {
-    id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    taskTitle: taskTitle || '老闆交代任務',
-    summary: summary || '請余彥佐依老闆指示處理',
-    rawInstruction: rawInstruction || '',
-    deadline: deadline || '',
-    priority: priority || 'normal',
-    createdAt: Date.now(),
-    status: 'pending',
-  };
-  bossTasks.unshift(newTask);
-  saveBossTasks();
-  res.json(newTask);
-});
-
-app.post('/api/boss-tasks/:id/deliver', (req, res) => {
-  const task = bossTasks.find((t) => t.id === req.params.id);
-  if (task && task.status === 'pending') {
-    task.status = 'delivered';
-    task.deliveredAt = Date.now();
-    saveBossTasks();
-  }
-  res.json({ success: true, task });
-});
-
-app.post('/api/boss-tasks/:id/complete', (req, res) => {
-  const task = bossTasks.find((t) => t.id === req.params.id);
-  if (task) {
-    task.status = 'completed';
-    task.completedAt = Date.now();
-    saveBossTasks();
-  }
-  res.json({ success: true, task });
-});
-
-app.delete('/api/boss-tasks/:id', (req, res) => {
-  bossTasks = bossTasks.filter((t) => t.id !== req.params.id);
-  saveBossTasks();
-  res.json({ success: true });
-});
-
-// Chat endpoint (supports text, files, audio, and role)
-app.post('/api/chat', async (req, res) => {
+// Tasks API - Multi-user RBAC
+app.get('/api/boss-tasks', authenticateToken, async (req, res) => {
   try {
-    const { history = [], message = '', audio, file, role = 'employee' } = req.body;
+    const tasks = await listVisibleTasks({
+      userId: req.user!.userId,
+      userRole: req.user!.role,
+      tenantId: req.user!.tenantId,
+    });
+    res.json(tasks);
+  } catch (err: any) {
+    console.warn('Notice: Unable to query tasks from database, returning empty list:', err.message);
+    res.json([]);
+  }
+});
+
+app.get('/api/boss-tasks/pending', authenticateToken, async (req, res) => {
+  try {
+    const tasks = await listVisibleTasks({
+      userId: req.user!.userId,
+      userRole: req.user!.role,
+      tenantId: req.user!.tenantId,
+    });
+    const pending = tasks.filter((t) => t.status === 'pending');
+    res.json(pending);
+  } catch (err: any) {
+    console.warn('Notice: Unable to query pending tasks from database, returning empty list:', err.message);
+    res.json([]);
+  }
+});
+
+// Create task: admin, boss, or user can delegate tasks
+app.post('/api/boss-tasks', authenticateToken, denyGuest, async (req, res) => {
+  try {
+    const { taskTitle, summary, rawInstruction, deadline, priority, assigneeId, assigneeName } = req.body;
+    const user = req.user!;
+
+    const targetAssigneeId = assigneeId || 'ALL';
+
+    const newTask = await createTask({
+      creatorId: user.userId,
+      creatorName: user.displayName,
+      creatorRole: user.role,
+      assigneeId: targetAssigneeId,
+      assigneeName,
+      taskTitle: taskTitle || '交代任務',
+      summary: summary || '請依指示處理',
+      rawInstruction: rawInstruction || '',
+      deadline: deadline || '',
+      priority: priority || 'normal',
+      tenantId: user.tenantId,
+    });
+
+    res.json(newTask);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Acknowledge delivery of task
+app.post('/api/boss-tasks/:id/deliver', authenticateToken, denyGuest, async (req, res) => {
+  try {
+    const task = await deliverTask(req.params.id, req.user!.userId, req.user!.tenantId);
+    res.json({ success: true, task });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Mark task as completed
+app.post('/api/boss-tasks/:id/complete', authenticateToken, denyGuest, async (req, res) => {
+  try {
+    const task = await completeTask(req.params.id, req.user!.userId, req.user!.tenantId);
+    res.json({ success: true, task });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Delete delegation task
+app.delete('/api/boss-tasks/:id', authenticateToken, denyGuest, async (req, res) => {
+  try {
+    await deleteTask(req.params.id, req.user!.userId, req.user!.role, req.user!.tenantId);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(403).json({ error: err.message });
+  }
+});
+
+// User Isolated Data APIs: Alarms, Notes, Schedules
+app.get('/api/user/alarms', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const alarms = await listUserAlarms(req.user!.userId, req.user!.tenantId);
+    res.json(alarms);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '無法取得鬧鐘清單' });
+  }
+});
+
+app.post('/api/user/alarms', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    // Strictly pass req.body, but userDataService discards any userId/tenantId inside req.body
+    const alarm = await saveUserAlarm(req.user!.userId, req.body, req.user!.tenantId);
+    res.status(201).json(alarm);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || '儲存鬧鐘失敗' });
+  }
+});
+
+app.patch('/api/user/alarms/:id/toggle', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const updated = await toggleUserAlarm(req.user!.userId, req.params.id, req.user!.tenantId);
+    res.json(updated);
+  } catch (err: any) {
+    const status = err.message?.includes('找不到') ? 404 : 400;
+    res.status(status).json({ error: err.message || '切換鬧鐘狀態失敗' });
+  }
+});
+
+app.delete('/api/user/alarms/:id', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    await deleteUserAlarm(req.user!.userId, req.params.id, req.user!.tenantId);
+    res.json({ success: true });
+  } catch (err: any) {
+    const status = err.message?.includes('找不到') ? 404 : 400;
+    res.status(status).json({ error: err.message || '刪除鬧鐘失敗' });
+  }
+});
+
+// Notes
+app.get('/api/user/notes', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const notes = await listUserNotes(req.user!.userId, req.user!.tenantId);
+    res.json(notes);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '無法取得筆記清單' });
+  }
+});
+
+app.post('/api/user/notes', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const note = await saveUserNote(req.user!.userId, req.body, req.user!.tenantId);
+    res.status(201).json(note);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || '儲存筆記失敗' });
+  }
+});
+
+app.patch('/api/user/notes/:id/toggle', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const updated = await toggleUserNote(req.user!.userId, req.params.id, req.user!.tenantId);
+    res.json(updated);
+  } catch (err: any) {
+    const status = err.message?.includes('找不到') ? 404 : 400;
+    res.status(status).json({ error: err.message || '切換筆記狀態失敗' });
+  }
+});
+
+app.delete('/api/user/notes/:id', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    await deleteUserNote(req.user!.userId, req.params.id, req.user!.tenantId);
+    res.json({ success: true });
+  } catch (err: any) {
+    const status = err.message?.includes('找不到') ? 404 : 400;
+    res.status(status).json({ error: err.message || '刪除筆記失敗' });
+  }
+});
+
+// Schedules
+app.get('/api/user/schedules', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const schedules = await listUserSchedules(req.user!.userId, req.user!.tenantId);
+    res.json(schedules);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '無法取得行程清單' });
+  }
+});
+
+app.post('/api/user/schedules', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const schedule = await saveUserSchedule(req.user!.userId, req.body, req.user!.tenantId);
+    res.status(201).json(schedule);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || '儲存行程失敗' });
+  }
+});
+
+app.delete('/api/user/schedules/:id', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    await deleteUserSchedule(req.user!.userId, req.params.id, req.user!.tenantId);
+    res.json({ success: true });
+  } catch (err: any) {
+    const status = err.message?.includes('找不到') ? 404 : 400;
+    res.status(status).json({ error: err.message || '刪除行程失敗' });
+  }
+});
+
+// Bulk One-Time Migration from LocalStorage (with deduplication against live Firestore)
+app.post('/api/user/import-local', authenticateToken, denyGuest, async (req: Request, res: Response) => {
+  try {
+    const result = await importLocalData(req.user!.userId, req.user!.tenantId, req.body);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '本機生活資料匯入遷移失敗' });
+  }
+});
+
+// Chat endpoint (supports text, files, audio, and role) - Protected by Token
+app.post('/api/chat', authenticateToken, async (req, res) => {
+  try {
+    const { history = [], message = '', audio, file } = req.body;
+    const sessionUser = (req as any).user;
+    const role = sessionUser.role; // Enforce role from verified token, reject client-side spoofing
 
     const ai = getGeminiClient();
 
-    // Select system instruction according to user role
-    const isBoss = role === 'boss';
-    const systemInstruction = isBoss ? SU_RUOYU_BOSS_INSTRUCTION : SU_RUOYU_EMPLOYEE_INSTRUCTION;
+    // Select system instruction according to live verified user role & custom admin settings
+    let systemInstruction = SU_RUOYU_BOSS_INSTRUCTION;
+    let recipientLabel = '老闆';
+
+    if (role === 'admin') {
+      const customCall = sessionUser.adminCustomSettings?.customCallName || '創辦人兼最高主管';
+      const customTone = sessionUser.adminCustomSettings?.customTonePrompt || '';
+      recipientLabel = customCall;
+      systemInstruction = `${SU_RUOYU_BOSS_INSTRUCTION}
+\n【★★★ 針對最高管理員/ADMIN 的特別專屬設定 ★★★】
+- 當前互動對象是擁有最高系統權限的專屬管理者，稱呼他為「${customCall}」。
+- 態度需具備最高等級的秘書默契、精明俐落與絕對忠誠，支持其指揮全局與管理所有同仁。
+${customTone ? `- 專屬語氣與氛圍微調：${customTone}` : ''}`;
+    } else if (role === 'boss') {
+      recipientLabel = '老闆';
+      systemInstruction = SU_RUOYU_BOSS_INSTRUCTION;
+    } else if (role === 'user') {
+      recipientLabel = sessionUser.displayName || '同仁';
+      systemInstruction = `${SU_RUOYU_BOSS_INSTRUCTION.replace(/【1\. 核心角色定位】[\s\S]*?【2\./, `【1. 核心角色定位】
+- 姓名：蘇若妤。
+- 身份：頂尖行政秘書總監、高智商全能助理。
+- 關係對象：眼前的使用者是工作同仁「${recipientLabel}」（客氣稱呼「${recipientLabel}」）。
+- 核心態度：精明俐落、專業效率、互助合作。以可靠專業的大秘書風範協助同仁處理事務、記錄交辦與規劃日程。自稱「若妤」。\n\n【2.`)}`;
+    } else {
+      recipientLabel = '訪客朋友';
+      systemInstruction = `${SU_RUOYU_BOSS_INSTRUCTION}
+\n【★★★ 訪客體驗模式提示 ★★★】
+- 當前互動對象是「訪客體驗者」。
+- 請以親切、精明且驚艷的專業秘書風範展示你的全能秘書能力，引導其體驗聊天、日程與任務交辦功能。`;
+    }
+
+    const isBoss = role === 'boss' || role === 'admin';
 
     // Prepare contents array
     const contents: any[] = [];
@@ -407,34 +798,42 @@ app.post('/api/chat', async (req, res) => {
       reply = response.text || '';
     }
 
-    // If this is a delegation task from Boss, automatically register it in shared brain
-    if (isBoss && action && action.type === 'DELEGATE_TASK') {
-      const newTask: ServerBossTask = {
-        id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        taskTitle: action.taskTitle || '老闆交代事項',
-        summary: action.taskSummary || message || '請余彥佐依老闆指示處理',
-        rawInstruction: message || '',
-        deadline: action.taskDeadline || '',
-        priority: (action.taskPriority as any) || 'normal',
-        createdAt: Date.now(),
-        status: 'pending',
-      };
-      bossTasks.unshift(newTask);
-      saveBossTasks();
-      action.delegatedTaskId = newTask.id;
+    // If this is a delegation task from Boss or Admin, automatically register it in Firestore
+    if ((role === 'boss' || role === 'admin') && action && action.type === 'DELEGATE_TASK') {
+      try {
+        const newTask = await createTask({
+          creatorId: sessionUser.userId,
+          creatorName: sessionUser.displayName,
+          creatorRole: sessionUser.role,
+          assigneeId: action.assigneeId || 'ALL',
+          taskTitle: action.taskTitle || '交辦事項',
+          summary: action.taskSummary || message || '請依指示處理',
+          rawInstruction: message || '',
+          deadline: action.taskDeadline || '',
+          priority: (action.taskPriority as any) || 'normal',
+          tenantId: sessionUser.tenantId,
+        });
+        action.delegatedTaskId = newTask.id;
+      } catch (taskErr) {
+        console.error('Failed to auto-create delegated task in Firestore:', taskErr);
+      }
     }
 
     res.json({ reply, action });
   } catch (error: any) {
     console.error('Chat error:', error);
-    res.status(500).json({
-      error: error?.message || '生成回覆時發生錯誤，請稍後再試。',
+    const errMsg = error?.message || String(error);
+    const isOverloaded = errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE');
+    res.status(isOverloaded ? 503 : 500).json({
+      error: isOverloaded
+        ? '目前 AI 秘書服務流量龐大（短暫尖峰），請稍候 2~3 秒後再次傳送。'
+        : (error?.message || '生成回覆時發生錯誤，請稍後再試。'),
     });
   }
 });
 
-// Voice analysis endpoint (specifically analyzes audio characteristics)
-app.post('/api/analyze-voice', async (req, res) => {
+// Voice analysis endpoint (specifically analyzes audio characteristics) - Protected by Token
+app.post('/api/analyze-voice', authenticateToken, async (req, res) => {
   try {
     const { audio } = req.body;
 
@@ -501,8 +900,12 @@ app.post('/api/analyze-voice', async (req, res) => {
     res.json(parsed);
   } catch (error: any) {
     console.error('Voice analysis error:', error);
-    res.status(500).json({
-      error: error?.message || '語音分析失敗，請確認音訊格式後重試。',
+    const errMsg = error?.message || String(error);
+    const isOverloaded = errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE');
+    res.status(isOverloaded ? 503 : 500).json({
+      error: isOverloaded
+        ? '語音分析服務目前處於高流量高峰，請稍候再試。'
+        : (error?.message || '語音分析失敗，請確認音訊格式後重試。'),
     });
   }
 });

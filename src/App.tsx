@@ -6,6 +6,8 @@ import { SecretaryDashboard } from './components/SecretaryDashboard.tsx';
 import { AlarmRingingModal } from './components/AlarmRingingModal.tsx';
 import { ConfirmClearModal } from './components/ConfirmClearModal.tsx';
 import { BossTaskBriefingModal } from './components/BossTaskBriefingModal.tsx';
+import { AuthModal } from './components/AuthModal.tsx';
+import { AdminPanelModal } from './components/AdminPanelModal.tsx';
 import {
   ChatMessage,
   AttachedFile,
@@ -15,8 +17,9 @@ import {
   SecretaryAction,
   UserRole,
   BossTask,
+  AuthUser,
 } from './types.ts';
-import { Loader2, AlertCircle, Briefcase } from 'lucide-react';
+import { Loader2, AlertCircle, Briefcase, CloudUpload, CheckCircle2 } from 'lucide-react';
 import { playNotificationDing } from './utils/audioAlarm.ts';
 
 const EMPLOYEE_INITIAL_MESSAGE: ChatMessage = {
@@ -46,18 +49,27 @@ const BOSS_INITIAL_MESSAGE: ChatMessage = {
 };
 
 export default function App() {
-  // Current user role: 'employee' (余彥佐) vs 'boss' (老闆)
-  const [currentRole, setCurrentRole] = useState<UserRole>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlRole = params.get('role') as UserRole;
-    if (urlRole === 'boss' || urlRole === 'employee') {
-      return urlRole;
-    }
-    const saved = localStorage.getItem('su_ruoyu_active_role') as UserRole;
-    return saved === 'boss' ? 'boss' : 'employee';
+  // Authentication state
+  const [authToken, setAuthToken] = useState<string | null>(() => {
+    return localStorage.getItem('su_ruoyu_auth_token') || null;
   });
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => {
+    const savedUser = localStorage.getItem('su_ruoyu_auth_user');
+    if (savedUser) {
+      try {
+        return JSON.parse(savedUser);
+      } catch (e) {}
+    }
+    return null;
+  });
+  const [isVerifyingAuth, setIsVerifyingAuth] = useState<boolean>(true);
 
-  // Isolated chat histories for Employee and Boss to guarantee privacy
+  const [isAdminPanelOpen, setIsAdminPanelOpen] = useState<boolean>(false);
+
+  // Current user role: derived directly from authenticated session
+  const currentRole: UserRole = authUser?.role || 'user';
+
+  // Isolated chat histories for Users and Boss/Admin
   const [employeeMessages, setEmployeeMessages] = useState<ChatMessage[]>(() => {
     const saved = localStorage.getItem('su_ruoyu_employee_chat');
     if (saved) {
@@ -81,7 +93,8 @@ export default function App() {
   });
 
   // Active messages based on current role
-  const activeMessages = currentRole === 'boss' ? bossMessages : employeeMessages;
+  const isBossOrAdmin = currentRole === 'boss' || currentRole === 'admin';
+  const activeMessages = isBossOrAdmin ? bossMessages : employeeMessages;
 
   // Boss tasks from server (Shared Brain)
   const [bossTasks, setBossTasks] = useState<BossTask[]>([]);
@@ -89,45 +102,19 @@ export default function App() {
   const [isBriefingModalOpen, setIsBriefingModalOpen] = useState<boolean>(false);
   const [completedTaskIds, setCompletedTaskIds] = useState<string[]>([]);
 
-  // Secretary state: Alarms, Notes, Schedules
-  const [alarms, setAlarms] = useState<AlarmItem[]>(() => {
-    const saved = localStorage.getItem('su_ruoyu_alarms');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.filter((a: AlarmItem) => a.id !== 'alarm-1' && a.id !== 'alarm-2');
-        }
-      } catch (e) {}
-    }
-    return [];
-  });
+  // Secretary state: Alarms, Notes, Schedules (InMemory state for Guest, Cloud Firestore for Authenticated users)
+  const [alarms, setAlarms] = useState<AlarmItem[]>([]);
+  const [notes, setNotes] = useState<NoteItem[]>([]);
+  const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
 
-  const [notes, setNotes] = useState<NoteItem[]>(() => {
-    const saved = localStorage.getItem('su_ruoyu_notes');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.filter((n: NoteItem) => n.id !== 'note-1' && n.id !== 'note-2');
-        }
-      } catch (e) {}
-    }
-    return [];
-  });
-
-  const [schedules, setSchedules] = useState<ScheduleItem[]>(() => {
-    const saved = localStorage.getItem('su_ruoyu_schedules');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.filter((s: ScheduleItem) => s.id !== 'sched-1');
-        }
-      } catch (e) {}
-    }
-    return [];
-  });
+  // Migration state for legacy browser localStorage
+  const [pendingMigration, setPendingMigration] = useState<{
+    alarms: AlarmItem[];
+    notes: NoteItem[];
+    schedules: ScheduleItem[];
+  } | null>(null);
+  const [isMigrating, setIsMigrating] = useState<boolean>(false);
+  const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
 
   const [isDashboardOpen, setIsDashboardOpen] = useState<boolean>(false);
   const [isConfirmClearOpen, setIsConfirmClearOpen] = useState<boolean>(false);
@@ -154,28 +141,196 @@ export default function App() {
     localStorage.setItem('su_ruoyu_boss_chat', JSON.stringify(bossMessages));
   }, [bossMessages]);
 
-  useEffect(() => {
-    localStorage.setItem('su_ruoyu_alarms', JSON.stringify(alarms));
-  }, [alarms]);
-
-  useEffect(() => {
-    localStorage.setItem('su_ruoyu_notes', JSON.stringify(notes));
-  }, [notes]);
-
-  useEffect(() => {
-    localStorage.setItem('su_ruoyu_schedules', JSON.stringify(schedules));
-  }, [schedules]);
-
-  // Fetch boss tasks from backend
-  const fetchBossTasks = async () => {
+  // Check legacy localStorage for un-migrated life data
+  const checkLegacyLocalStorage = () => {
     try {
-      const res = await fetch('/api/boss-tasks');
-      if (res.ok) {
+      const rawAlarms = localStorage.getItem('su_ruoyu_alarms');
+      const rawNotes = localStorage.getItem('su_ruoyu_notes');
+      const rawScheds = localStorage.getItem('su_ruoyu_schedules');
+
+      let parsedAlarms: AlarmItem[] = [];
+      let parsedNotes: NoteItem[] = [];
+      let parsedScheds: ScheduleItem[] = [];
+
+      if (rawAlarms) {
+        const arr = JSON.parse(rawAlarms);
+        if (Array.isArray(arr)) {
+          parsedAlarms = arr.filter((a) => a && a.time);
+        }
+      }
+      if (rawNotes) {
+        const arr = JSON.parse(rawNotes);
+        if (Array.isArray(arr)) {
+          parsedNotes = arr.filter((n) => n && n.content);
+        }
+      }
+      if (rawScheds) {
+        const arr = JSON.parse(rawScheds);
+        if (Array.isArray(arr)) {
+          parsedScheds = arr.filter((s) => s && s.title && s.date);
+        }
+      }
+
+      if (parsedAlarms.length > 0 || parsedNotes.length > 0 || parsedScheds.length > 0) {
+        setPendingMigration({
+          alarms: parsedAlarms,
+          notes: parsedNotes,
+          schedules: parsedScheds,
+        });
+      } else {
+        setPendingMigration(null);
+      }
+    } catch (e) {
+      console.warn('Error reading legacy storage:', e);
+    }
+  };
+
+  // Fetch authoritative user life data from Cloud Firestore
+  const fetchUserData = async () => {
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    const storedUser = authUser || (localStorage.getItem('su_ruoyu_auth_user') ? JSON.parse(localStorage.getItem('su_ruoyu_auth_user')!) : null);
+    if (!token || storedUser?.role === 'guest') return;
+
+    try {
+      const [alarmsRes, notesRes, schedulesRes] = await Promise.all([
+        fetch('/api/user/alarms', { headers: { Authorization: `Bearer ${token}` } }),
+        fetch('/api/user/notes', { headers: { Authorization: `Bearer ${token}` } }),
+        fetch('/api/user/schedules', { headers: { Authorization: `Bearer ${token}` } }),
+      ]);
+
+      if (alarmsRes.ok && alarmsRes.headers.get('content-type')?.includes('application/json')) {
+        const data = await alarmsRes.json();
+        setAlarms(data);
+      } else if (alarmsRes.status === 401) {
+        handleLogout();
+        return;
+      }
+
+      if (notesRes.ok && notesRes.headers.get('content-type')?.includes('application/json')) {
+        const data = await notesRes.json();
+        setNotes(data);
+      }
+
+      if (schedulesRes.ok && schedulesRes.headers.get('content-type')?.includes('application/json')) {
+        const data = await schedulesRes.json();
+        setSchedules(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch user cloud data:', e);
+    }
+  };
+
+  // Validate auth session with backend on startup
+  useEffect(() => {
+    const checkAuth = async () => {
+      const token = localStorage.getItem('su_ruoyu_auth_token');
+      if (!token) {
+        setAuthToken(null);
+        setAuthUser(null);
+        setIsVerifyingAuth(false);
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        const isJson = res.headers.get('content-type')?.includes('application/json');
+        if (res.ok && isJson) {
+          const data = await res.json();
+          if (data.user) {
+            const verifiedUser: AuthUser = {
+              id: data.user.id,
+              email: data.user.email,
+              role: data.user.role,
+              name: data.user.name,
+              token: token,
+              tenantId: data.user.tenantId,
+              adminCustomSettings: data.user.adminCustomSettings,
+            };
+            setAuthUser(verifiedUser);
+            setAuthToken(token);
+            localStorage.setItem('su_ruoyu_auth_user', JSON.stringify(verifiedUser));
+
+            if (verifiedUser.role !== 'guest') {
+              fetchUserData();
+              checkLegacyLocalStorage();
+            }
+          } else {
+            handleLogout();
+          }
+        } else if (res.status === 401) {
+          // Token expired, invalid or revoked
+          handleLogout();
+        }
+      } catch (err) {
+        console.error('Auth verification error:', err);
+      } finally {
+        setIsVerifyingAuth(false);
+      }
+    };
+
+    checkAuth();
+  }, []);
+
+  const handleLoginSuccess = (user: AuthUser) => {
+    setAuthToken(user.token);
+    setAuthUser(user);
+    localStorage.setItem('su_ruoyu_auth_token', user.token);
+    localStorage.setItem('su_ruoyu_auth_user', JSON.stringify(user));
+    setErrorMessage(null);
+
+    if (user.role !== 'guest') {
+      fetchUserData();
+      checkLegacyLocalStorage();
+    }
+  };
+
+  const handleLogout = async () => {
+    stopSpeaking();
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (token) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch (e) {
+        console.error('Failed to notify backend of logout:', e);
+      }
+    }
+    setAuthToken(null);
+    setAuthUser(null);
+    setAlarms([]);
+    setNotes([]);
+    setSchedules([]);
+    setBossTasks([]);
+    setPendingMigration(null);
+    localStorage.removeItem('su_ruoyu_auth_token');
+    localStorage.removeItem('su_ruoyu_auth_user');
+  };
+
+  // Fetch boss tasks from backend (Authenticated)
+  const fetchBossTasks = async () => {
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return [];
+
+    try {
+      const res = await fetch('/api/boss-tasks', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const isJson = res.headers.get('content-type')?.includes('application/json');
+      if (res.ok && isJson) {
         const data: BossTask[] = await res.json();
         setBossTasks(data);
         const completed = data.filter((t) => t.status === 'completed').map((t) => t.id);
         setCompletedTaskIds(completed);
         return data;
+      } else if (res.status === 401) {
+        handleLogout();
       }
     } catch (e) {
       console.error('Failed to fetch boss tasks:', e);
@@ -184,16 +339,29 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchBossTasks();
-    const interval = setInterval(fetchBossTasks, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    if (authToken) {
+      fetchBossTasks();
+      const interval = setInterval(fetchBossTasks, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [authToken]);
 
-  // When Employee opens the app, check if there are any pending tasks to brief
+  // When User opens the app, check if there are any pending tasks assigned to them to brief
   useEffect(() => {
-    if (currentRole === 'employee') {
-      fetch('/api/boss-tasks/pending')
-        .then((r) => (r.ok ? r.json() : []))
+    if (authToken && currentRole === 'user') {
+      fetch('/api/boss-tasks/pending', {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      })
+        .then((r) => {
+          if (r.status === 401) {
+            handleLogout();
+            return [];
+          }
+          const isJson = r.headers.get('content-type')?.includes('application/json');
+          return r.ok && isJson ? r.json() : [];
+        })
         .then((pendingTasks: BossTask[]) => {
           if (pendingTasks && pendingTasks.length > 0) {
             setPendingModalTasks(pendingTasks);
@@ -202,7 +370,7 @@ export default function App() {
         })
         .catch((e) => console.error(e));
     }
-  }, [currentRole]);
+  }, [authToken, currentRole]);
 
   // Scroll to bottom on updates
   useEffect(() => {
@@ -230,15 +398,6 @@ export default function App() {
 
     return () => clearInterval(interval);
   }, [alarms, ringingAlarm]);
-
-  // Switch role handler
-  const handleSwitchRole = (newRole: UserRole) => {
-    stopSpeaking();
-    setCurrentRole(newRole);
-    const url = new URL(window.location.href);
-    url.searchParams.set('role', newRole);
-    window.history.replaceState({}, '', url.toString());
-  };
 
   // TTS Speech Synthesis Helper
   const speakText = (text: string) => {
@@ -289,6 +448,391 @@ export default function App() {
     }
   };
 
+  // Cloud & Memory Handlers for Alarms, Notes, Schedules
+  const handleToggleAlarm = async (id: string) => {
+    if (authUser?.role === 'guest') {
+      setAlarms((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a))
+      );
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`/api/user/alarms/${id}/toggle`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setAlarms((prev) => prev.map((a) => (a.id === id ? updated : a)));
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to toggle alarm:', e);
+    }
+  };
+
+  const handleDeleteAlarm = async (id: string) => {
+    if (authUser?.role === 'guest') {
+      setAlarms((prev) => prev.filter((a) => a.id !== id));
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`/api/user/alarms/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setAlarms((prev) => prev.filter((a) => a.id !== id));
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to delete alarm:', e);
+    }
+  };
+
+  const handleAddAlarm = async (time: string, label: string) => {
+    if (authUser?.role === 'guest') {
+      const newAlarm: AlarmItem = {
+        id: `alarm-${Date.now()}`,
+        time,
+        label,
+        enabled: true,
+        createdAt: Date.now(),
+      };
+      setAlarms((prev) => [newAlarm, ...prev]);
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch('/api/user/alarms', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ time, label, enabled: true }),
+      });
+      if (res.ok) {
+        const saved = await res.json();
+        setAlarms((prev) => [saved, ...prev.filter((a) => a.id !== saved.id)]);
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to add alarm:', e);
+    }
+  };
+
+  // Note handlers
+  const handleToggleNote = async (id: string) => {
+    if (authUser?.role === 'guest') {
+      setNotes((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, completed: !n.completed } : n))
+      );
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`/api/user/notes/${id}/toggle`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to toggle note:', e);
+    }
+  };
+
+  const handleDeleteNote = async (id: string) => {
+    if (authUser?.role === 'guest') {
+      setNotes((prev) => prev.filter((n) => n.id !== id));
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`/api/user/notes/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setNotes((prev) => prev.filter((n) => n.id !== id));
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to delete note:', e);
+    }
+  };
+
+  const handleAddNote = async (content: string) => {
+    if (authUser?.role === 'guest') {
+      const newNote: NoteItem = {
+        id: `note-${Date.now()}`,
+        content,
+        completed: false,
+        createdAt: Date.now(),
+      };
+      setNotes((prev) => [newNote, ...prev]);
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch('/api/user/notes', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ content, completed: false }),
+      });
+      if (res.ok) {
+        const saved = await res.json();
+        setNotes((prev) => [saved, ...prev.filter((n) => n.id !== saved.id)]);
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to add note:', e);
+    }
+  };
+
+  // Schedule handlers
+  const handleAddSchedule = async (
+    title: string,
+    date: string,
+    time?: string,
+    location?: string,
+    details?: string
+  ) => {
+    if (authUser?.role === 'guest') {
+      const newSched: ScheduleItem = {
+        id: `sched-${Date.now()}`,
+        title,
+        date,
+        time,
+        location,
+        details,
+        createdAt: Date.now(),
+      };
+      setSchedules((prev) => [newSched, ...prev]);
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch('/api/user/schedules', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ title, date, time, location, details }),
+      });
+      if (res.ok) {
+        const saved = await res.json();
+        setSchedules((prev) => [saved, ...prev.filter((s) => s.id !== saved.id)]);
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to add schedule:', e);
+    }
+  };
+
+  const handleDeleteSchedule = async (id: string) => {
+    if (authUser?.role === 'guest') {
+      setSchedules((prev) => prev.filter((s) => s.id !== id));
+      return;
+    }
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`/api/user/schedules/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setSchedules((prev) => prev.filter((s) => s.id !== id));
+      } else if (res.status === 401) {
+        handleLogout();
+      }
+    } catch (e) {
+      console.error('Failed to delete schedule:', e);
+    }
+  };
+
+  const handleClearAlarms = async () => {
+    const isGuest = authUser?.role === 'guest';
+    const currentAlarms = [...alarms];
+    setAlarms([]);
+    if (!isGuest) {
+      const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+      if (token) {
+        await Promise.all(
+          currentAlarms.map((a) =>
+            fetch(`/api/user/alarms/${a.id}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {})
+          )
+        );
+      }
+    }
+  };
+
+  const handleClearNotes = async () => {
+    const isGuest = authUser?.role === 'guest';
+    const currentNotes = [...notes];
+    setNotes([]);
+    if (!isGuest) {
+      const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+      if (token) {
+        await Promise.all(
+          currentNotes.map((n) =>
+            fetch(`/api/user/notes/${n.id}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {})
+          )
+        );
+      }
+    }
+  };
+
+  const handleClearSchedules = async () => {
+    const isGuest = authUser?.role === 'guest';
+    const currentScheds = [...schedules];
+    setSchedules([]);
+    if (!isGuest) {
+      const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+      if (token) {
+        await Promise.all(
+          currentScheds.map((s) =>
+            fetch(`/api/user/schedules/${s.id}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {})
+          )
+        );
+      }
+    }
+  };
+
+  // Migration Handlers
+  const handleExecuteMigration = async () => {
+    if (!pendingMigration) return;
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token || authUser?.role === 'guest') return;
+
+    setIsMigrating(true);
+    setMigrationMessage(null);
+    try {
+      const res = await fetch('/api/user/import-local', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          alarms: pendingMigration.alarms,
+          notes: pendingMigration.notes,
+          schedules: pendingMigration.schedules,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || '匯入遷移失敗');
+      }
+
+      const result = await res.json();
+      if (result.alarms) setAlarms(result.alarms);
+      if (result.notes) setNotes(result.notes);
+      if (result.schedules) setSchedules(result.schedules);
+
+      // Requirement 6: Only remove legacy localStorage items if ALL data was successfully migrated with NO failures.
+      // If partial failures occurred, retain unimported failed items in localStorage and pendingMigration so data is never lost!
+      if (result.hasFailures) {
+        const remainingAlarms = result.failedAlarms || [];
+        const remainingNotes = result.failedNotes || [];
+        const remainingSchedules = result.failedSchedules || [];
+
+        if (remainingAlarms.length > 0) {
+          localStorage.setItem('su_ruoyu_alarms', JSON.stringify(remainingAlarms));
+        } else {
+          localStorage.removeItem('su_ruoyu_alarms');
+        }
+
+        if (remainingNotes.length > 0) {
+          localStorage.setItem('su_ruoyu_notes', JSON.stringify(remainingNotes));
+        } else {
+          localStorage.removeItem('su_ruoyu_notes');
+        }
+
+        if (remainingSchedules.length > 0) {
+          localStorage.setItem('su_ruoyu_schedules', JSON.stringify(remainingSchedules));
+        } else {
+          localStorage.removeItem('su_ruoyu_schedules');
+        }
+
+        setPendingMigration({
+          alarms: remainingAlarms,
+          notes: remainingNotes,
+          schedules: remainingSchedules,
+        });
+
+        const failedTotal = remainingAlarms.length + remainingNotes.length + remainingSchedules.length;
+        setMigrationMessage(
+          `部分生活資料已寫入雲端（${result.importedAlarmsCount} 鬧鐘、${result.importedNotesCount} 筆記、${result.importedSchedulesCount} 行程），但有 ${failedTotal} 筆資料寫入失敗，已嚴格保留在您的本機資料中，未被清除。`
+        );
+      } else {
+        // Complete success: safely clear legacy localStorage items
+        localStorage.removeItem('su_ruoyu_alarms');
+        localStorage.removeItem('su_ruoyu_notes');
+        localStorage.removeItem('su_ruoyu_schedules');
+        setPendingMigration(null);
+        setMigrationMessage(
+          `生活資料已全數順利遷移至雲端！共匯入 ${result.importedAlarmsCount} 項鬧鐘、${result.importedNotesCount} 則筆記、${result.importedSchedulesCount} 筆行程（重複項自動略過），本機快取已安全清除。`
+        );
+      }
+      setTimeout(() => setMigrationMessage(null), 7000);
+    } catch (err: any) {
+      setMigrationMessage(`匯入失敗：${err.message || '資料庫連線中斷，已保留本機全部資料'}`);
+    } finally {
+      setIsMigrating(false);
+    }
+  };
+
+  const handleDismissMigration = () => {
+    localStorage.removeItem('su_ruoyu_alarms');
+    localStorage.removeItem('su_ruoyu_notes');
+    localStorage.removeItem('su_ruoyu_schedules');
+    setPendingMigration(null);
+  };
+
   // Process and automatically execute assistant actions
   const executeSecretaryAction = (action: SecretaryAction) => {
     if (!action || action.type === 'NONE') return;
@@ -307,38 +851,22 @@ export default function App() {
 
     if (action.type === 'SET_ALARM') {
       playNotificationDing();
-      const newAlarm: AlarmItem = {
-        id: `alarm-${Date.now()}`,
-        time: action.alarmTime || '07:00',
-        label: action.label || '生活鬧鐘',
-        enabled: true,
-        createdAt: Date.now(),
-      };
-      setAlarms((prev) => [newAlarm, ...prev]);
+      handleAddAlarm(action.alarmTime || '07:00', action.label || '生活鬧鐘');
     }
 
     if (action.type === 'ADD_CALENDAR') {
       playNotificationDing();
-      const newSched: ScheduleItem = {
-        id: `sched-${Date.now()}`,
-        title: action.calendarTitle || '排定行程',
-        date: action.calendarDate || new Date().toISOString().split('T')[0],
-        time: action.calendarTime,
-        location: action.calendarLocation,
-        createdAt: Date.now(),
-      };
-      setSchedules((prev) => [newSched, ...prev]);
+      handleAddSchedule(
+        action.calendarTitle || '排定行程',
+        action.calendarDate || new Date().toISOString().split('T')[0],
+        action.calendarTime,
+        action.calendarLocation
+      );
     }
 
     if (action.type === 'ADD_NOTE' && action.noteContent) {
       playNotificationDing();
-      const newNote: NoteItem = {
-        id: `note-${Date.now()}`,
-        content: action.noteContent,
-        completed: false,
-        createdAt: Date.now(),
-      };
-      setNotes((prev) => [newNote, ...prev]);
+      handleAddNote(action.noteContent);
     }
 
     if (action.type === 'DELEGATE_TASK') {
@@ -350,6 +878,12 @@ export default function App() {
   const handleSendMessage = async (text: string, file?: AttachedFile) => {
     if (isLoading) return;
     setErrorMessage(null);
+
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) {
+      handleLogout();
+      return;
+    }
 
     const userMessageId = `user-${Date.now()}`;
     const userMsg: ChatMessage = {
@@ -377,7 +911,10 @@ export default function App() {
 
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           history: historyPayload,
           message: text,
@@ -394,6 +931,10 @@ export default function App() {
       });
 
       if (!res.ok) {
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         const errorJson = await res.json().catch(() => ({}));
         throw new Error(errorJson.error || `伺服器回應錯誤 (${res.status})`);
       }
@@ -469,8 +1010,19 @@ export default function App() {
 
   // Boss task completion
   const handleCompleteBossTask = async (taskId: string) => {
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) {
+      handleLogout();
+      return;
+    }
+
     try {
-      const res = await fetch(`/api/boss-tasks/${taskId}/complete`, { method: 'POST' });
+      const res = await fetch(`/api/boss-tasks/${taskId}/complete`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       if (res.ok) {
         setCompletedTaskIds((prev) => [...prev, taskId]);
         fetchBossTasks();
@@ -484,6 +1036,8 @@ export default function App() {
           timestamp: Date.now(),
         };
         setEmployeeMessages((prev) => [...prev, confirmMsg]);
+      } else if (res.status === 401) {
+        handleLogout();
       }
     } catch (e) {
       console.error('Failed to complete task:', e);
@@ -491,10 +1045,23 @@ export default function App() {
   };
 
   const handleDeleteBossTask = async (taskId: string) => {
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) {
+      handleLogout();
+      return;
+    }
+
     try {
-      const res = await fetch(`/api/boss-tasks/${taskId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/boss-tasks/${taskId}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       if (res.ok) {
         setBossTasks((prev) => prev.filter((t) => t.id !== taskId));
+      } else if (res.status === 401) {
+        handleLogout();
       }
     } catch (e) {
       console.error('Failed to delete boss task:', e);
@@ -504,8 +1071,19 @@ export default function App() {
   // Employee acknowledges briefing modal
   const handleAcknowledgeBriefing = async (task: BossTask) => {
     setIsBriefingModalOpen(false);
+    const token = authToken || localStorage.getItem('su_ruoyu_auth_token');
+    if (!token) {
+      handleLogout();
+      return;
+    }
+
     try {
-      await fetch(`/api/boss-tasks/${task.id}/deliver`, { method: 'POST' });
+      await fetch(`/api/boss-tasks/${task.id}/deliver`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       fetchBossTasks();
     } catch (e) {}
 
@@ -525,53 +1103,6 @@ export default function App() {
       },
     };
     setEmployeeMessages((prev) => [...prev, briefingMsg]);
-  };
-
-  // Alarm management handlers
-  const handleToggleAlarm = (id: string) => {
-    setAlarms((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a))
-    );
-  };
-
-  const handleDeleteAlarm = (id: string) => {
-    setAlarms((prev) => prev.filter((a) => a.id !== id));
-  };
-
-  const handleAddAlarm = (time: string, label: string) => {
-    const newAlarm: AlarmItem = {
-      id: `alarm-${Date.now()}`,
-      time,
-      label,
-      enabled: true,
-      createdAt: Date.now(),
-    };
-    setAlarms((prev) => [newAlarm, ...prev]);
-  };
-
-  // Note handlers
-  const handleToggleNote = (id: string) => {
-    setNotes((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, completed: !n.completed } : n))
-    );
-  };
-
-  const handleDeleteNote = (id: string) => {
-    setNotes((prev) => prev.filter((n) => n.id !== id));
-  };
-
-  const handleAddNote = (content: string) => {
-    const newNote: NoteItem = {
-      id: `note-${Date.now()}`,
-      content,
-      completed: false,
-      createdAt: Date.now(),
-    };
-    setNotes((prev) => [newNote, ...prev]);
-  };
-
-  const handleDeleteSchedule = (id: string) => {
-    setSchedules((prev) => prev.filter((s) => s.id !== id));
   };
 
   // Snooze handler
@@ -596,9 +1127,34 @@ export default function App() {
 
   const pendingBossTasksCount = bossTasks.filter((t) => t.status === 'pending').length;
 
+  // Unauthenticated or Verifying session
+  if (isVerifyingAuth) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-stone-900 text-stone-100">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 font-serif font-bold text-2xl shadow-lg animate-pulse">
+            蘇
+          </div>
+          <div className="flex items-center gap-2 text-stone-400 text-sm">
+            <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+            <span>正在驗證身分安全金鑰...</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authToken || !authUser) {
+    return (
+      <div className="min-h-screen bg-stone-950 flex items-center justify-center">
+        <AuthModal onLoginSuccess={handleLoginSuccess} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col min-h-screen bg-stone-50 text-stone-900">
-      {/* Top Header with Role Switcher */}
+      {/* Top Header with Authenticated Role Badge and Logout */}
       <Header
         ttsEnabled={ttsEnabled}
         onToggleTts={() => {
@@ -609,12 +1165,76 @@ export default function App() {
         onOpenDashboard={() => setIsDashboardOpen(true)}
         activeAlarmCount={alarms.filter((a) => a.enabled).length}
         currentRole={currentRole}
-        onSwitchRole={handleSwitchRole}
+        userName={authUser.name}
         pendingBossTaskCount={pendingBossTasksCount}
+        onLogout={handleLogout}
+        onOpenAdminPanel={() => setIsAdminPanelOpen(true)}
       />
 
       {/* Main Conversation Canvas */}
       <main className="flex-1 max-w-4xl w-full mx-auto flex flex-col justify-between pt-2 pb-4">
+        {/* LocalStorage Data Migration Alert Banner */}
+        {pendingMigration && authUser && authUser.role !== 'guest' && (
+          <div className="mx-4 my-2 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-900 text-xs shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <CloudUpload className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-stone-900 text-sm">
+                  偵測到本機舊版生活資料，是否一次性遷移至雲端資料庫？
+                </p>
+                <p className="text-stone-600 mt-0.5">
+                  包含 {pendingMigration.alarms.length} 項鬧鐘、{pendingMigration.notes.length} 則筆記、{pendingMigration.schedules.length} 筆行程。匯入時會自動比對並剔除重複項目，確認匯入成功後將安全清除本機暫存。
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+              <button
+                type="button"
+                onClick={handleDismissMigration}
+                disabled={isMigrating}
+                className="px-3 py-1.5 rounded-xl border border-stone-300 text-stone-600 hover:bg-stone-200 text-xs font-medium cursor-pointer transition"
+              >
+                捨棄本機資料
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteMigration}
+                disabled={isMigrating}
+                className="px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-medium cursor-pointer flex items-center gap-1.5 shadow-xs transition"
+              >
+                {isMigrating ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>遷移中...</span>
+                  </>
+                ) : (
+                  <>
+                    <CloudUpload className="w-3.5 h-3.5" />
+                    <span>確定匯入雲端</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Migration feedback message banner */}
+        {migrationMessage && (
+          <div className="mx-4 my-2 p-3 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between gap-2 shadow-xs">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{migrationMessage}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setMigrationMessage(null)}
+              className="text-emerald-500 hover:text-emerald-800 font-bold px-1 cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* Error notification banner */}
         {errorMessage && (
           <div className="mx-4 my-2 p-3 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center justify-between gap-2 shadow-xs">
@@ -693,18 +1313,9 @@ export default function App() {
         onDeleteSchedule={handleDeleteSchedule}
         onCompleteBossTask={handleCompleteBossTask}
         onDeleteBossTask={handleDeleteBossTask}
-        onClearAlarms={() => {
-          setAlarms([]);
-          localStorage.removeItem('su_ruoyu_alarms');
-        }}
-        onClearNotes={() => {
-          setNotes([]);
-          localStorage.removeItem('su_ruoyu_notes');
-        }}
-        onClearSchedules={() => {
-          setSchedules([]);
-          localStorage.removeItem('su_ruoyu_schedules');
-        }}
+        onClearAlarms={handleClearAlarms}
+        onClearNotes={handleClearNotes}
+        onClearSchedules={handleClearSchedules}
       />
 
       {/* Boss Task Briefing Modal when employee opens app with pending tasks */}
@@ -731,6 +1342,15 @@ export default function App() {
         onClose={() => setIsConfirmClearOpen(false)}
         onConfirm={handleConfirmClearChat}
       />
+
+      {/* Admin Panel Modal */}
+      {authUser && (
+        <AdminPanelModal
+          isOpen={isAdminPanelOpen}
+          onClose={() => setIsAdminPanelOpen(false)}
+          currentUser={authUser}
+        />
+      )}
     </div>
   );
 }
